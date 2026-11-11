@@ -1,0 +1,196 @@
+<!doctype html>
+<!-- TEMPORARY: runner animation options. Open via `npm run dev` → /anim-preview.html. Delete once a style is chosen. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Runner animation options</title>
+<style>
+  :root { --bg: #05010f; --panel: #0e0720; --line: #2a1a4d; --text: #e9d8ff; --dim: #8f7fb8; --cyan: #00f0ff; --yellow: #fcee0a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px 16px 48px; background: var(--bg); color: var(--text); font: 14px/1.45 ui-monospace, Menlo, monospace; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; letter-spacing: .08em; text-transform: uppercase; color: var(--yellow); }
+  h2 { font-size: 13px; margin: 28px 0 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--cyan); }
+  p { margin: 0; color: var(--dim); }
+  .bar { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; margin-top: 14px; }
+  .bar label { display: flex; gap: 8px; align-items: center; color: var(--dim); }
+  input[type=range] { accent-color: var(--cyan); width: 150px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; cursor: pointer; text-align: left; color: inherit; font: inherit; }
+  .card[aria-pressed=true] { border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow) inset; }
+  .card b { display: block; color: var(--text); margin-top: 8px; }
+  .card canvas, .strip canvas { display: block; width: 100%; background: linear-gradient(#140630, #3d0b4f 70%, #1a0830); border-radius: 4px; }
+  .swatches { display: flex; flex-wrap: wrap; gap: 12px; }
+  .swatches .card { width: 132px; }
+  .strip { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+  .strip canvas { width: auto; }
+  code { display: inline-block; margin-top: 6px; padding: 8px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; color: var(--yellow); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Runner animation options</h1>
+  <p>Click a card to select it. Jump cards and the frame strip use the selected run style and outfit.</p>
+  <div class="bar">
+    <label>Playback <input id="rate" type="range" min="0.1" max="1.5" step="0.05" value="1" /> <span id="rateOut">1.00×</span></label>
+    <label>Game speed <input id="speed" type="range" min="1" max="2.8" step="0.1" value="1" /> <span id="speedOut">start</span></label>
+  </div>
+
+  <h2>Run cycle</h2>
+  <div class="grid" id="runs"></div>
+
+  <h2>Jump (hold, then tap)</h2>
+  <div class="grid" id="jumps"></div>
+
+  <h2>Outfits (one is picked at random each run)</h2>
+  <div class="swatches" id="pals"></div>
+
+  <h2>Frames: run cycle, then jump arc</h2>
+  <div class="strip"><canvas id="strip"></canvas></div>
+
+  <h2>To apply</h2>
+  <p>Set this in <b>src/config.ts</b>:</p>
+  <code id="snippet"></code>
+</main>
+
+<script type="module">
+import { PALETTES, RUN_STYLES, JUMP_STYLES, LAND_TIME, LAND_EXIT_PHASE, runPose, airPose, landPose, cadence, drawRunner } from '/src/runner.ts';
+
+// Jump physics copied from RUN in src/config.ts so the arcs match the game.
+const PHYS = { gravity: 2600, holdGravity: 950, holdMax: 0.26, jumpVelocity: 760, startSpeed: 330 };
+const sel = { run: 'sprint', jump: 'leap', pal: 0 };
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+const $ = (id) => document.getElementById(id);
+
+function makeCard(parent, title, note, w, h, onClick) {
+  const card = document.createElement('button');
+  card.className = 'card';
+  const canvas = document.createElement('canvas');
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.aspectRatio = `${w} / ${h}`;
+  card.append(canvas);
+  if (title) card.insertAdjacentHTML('beforeend', `<b>${title}</b>`);
+  if (note) card.insertAdjacentHTML('beforeend', `<p>${note}</p>`);
+  card.addEventListener('click', onClick);
+  parent.append(card);
+  return { card, ctx: canvas.getContext('2d'), w, h };
+}
+
+function ground(ctx, w, y, scroll) {
+  ctx.fillStyle = '#0a0617';
+  ctx.fillRect(0, y, w, 400);
+  ctx.fillStyle = '#00f0ff';
+  ctx.fillRect(0, y, w, 1);
+  ctx.fillStyle = 'rgba(0,240,255,.35)';
+  for (let x = -(scroll % 40); x < w; x += 40) ctx.fillRect(x, y + 5, 14, 1.5);
+}
+
+const runCards = Object.entries(RUN_STYLES).map(([key, s]) => ({ key, phase: 0, ...makeCard($('runs'), s.label, s.note, 300, 190, () => select('run', key)) }));
+const jumpCards = Object.entries(JUMP_STYLES).map(([key, s]) => ({
+  key, y: 0, vy: 0, air: false, t: 0, hold: true, wait: 0.5, land: Infinity, phase: 0,
+  ...makeCard($('jumps'), s.label, s.note, 300, 340, () => select('jump', key)),
+}));
+const palCards = PALETTES.map((p, i) => ({ i, phase: i * 0.13, ...makeCard($('pals'), p.name, '', 110, 110, () => select('pal', i)) }));
+
+function select(kind, value) {
+  sel[kind] = value;
+  runCards.forEach((c) => c.card.setAttribute('aria-pressed', c.key === sel.run));
+  jumpCards.forEach((c) => c.card.setAttribute('aria-pressed', c.key === sel.jump));
+  palCards.forEach((c) => c.card.setAttribute('aria-pressed', c.i === sel.pal));
+  $('snippet').textContent = `export const RUNNER_STYLE = { run: '${sel.run}', jump: '${sel.jump}' }; // or jump: 'random'`;
+  drawStrip();
+}
+
+function drawStrip() {
+  const N = 16, M = 9, cw = 62, ch = 78, z = 1.25;
+  const canvas = $('strip');
+  canvas.width = (N + M) * cw * dpr;
+  canvas.height = ch * dpr;
+  canvas.style.width = `${(N + M) * cw}px`;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  for (let i = 0; i < N + M; i++) {
+    const pose = i < N ? runPose(sel.run, i / N) : airPose(sel.jump, (i - N) / (M - 1));
+    ctx.save();
+    ctx.translate(i * cw + 26, ch - 8);
+    ctx.scale(z, z);
+    drawRunner(ctx, pose, PALETTES[sel.pal]);
+    ctx.restore();
+  }
+}
+
+let last = performance.now();
+let scroll = 0;
+function frame(now) {
+  const rate = +$('rate').value;
+  const ratio = +$('speed').value;
+  const dt = Math.min((now - last) / 1000, 1 / 30) * rate;
+  last = now;
+  scroll += PHYS.startSpeed * ratio * dt;
+  $('rateOut').textContent = `${rate.toFixed(2)}×`;
+  $('speedOut').textContent = ratio === 1 ? 'start' : `${ratio.toFixed(1)}× start`;
+
+  for (const c of runCards) {
+    c.phase = (c.phase + cadence(c.key, ratio) * dt) % 1;
+    const z = 3, { ctx } = c;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, c.w, c.h);
+    ground(ctx, c.w, c.h - 16, scroll * z);
+    ctx.translate(c.w * 0.42, c.h - 16);
+    ctx.scale(z, z);
+    drawRunner(ctx, runPose(c.key, c.phase), PALETTES[sel.pal]);
+  }
+
+  for (const c of jumpCards) {
+    // Same integration and pose mapping as GameScene.
+    let pose;
+    if (c.air) {
+      const rising = c.vy < 0 && c.hold && c.t < PHYS.holdMax;
+      c.vy += (rising ? PHYS.holdGravity : PHYS.gravity) * dt;
+      c.t += dt;
+      c.y += c.vy * dt;
+      if (c.y >= 0) { c.y = 0; c.air = false; c.land = 0; c.wait = 0.55; c.hold = !c.hold; }
+    }
+    if (c.air) {
+      pose = airPose(c.key, 0.5 + c.vy / (2 * PHYS.jumpVelocity));
+    } else {
+      c.wait -= dt;
+      if (c.land < LAND_TIME) {
+        c.land += dt;
+        c.phase = LAND_EXIT_PHASE;
+        pose = landPose(sel.run, c.key, c.land / LAND_TIME);
+      } else {
+        c.phase = (c.phase + cadence(sel.run, ratio) * dt) % 1;
+        pose = runPose(sel.run, c.phase);
+      }
+      if (c.wait <= 0) { c.air = true; c.vy = -PHYS.jumpVelocity; c.t = 0; }
+    }
+    const z = 1.3, { ctx } = c;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, c.w, c.h);
+    ground(ctx, c.w, c.h - 14, scroll * z);
+    ctx.translate(c.w * 0.42, c.h - 14 + c.y * z);
+    ctx.scale(z, z);
+    drawRunner(ctx, pose, PALETTES[sel.pal]);
+  }
+
+  for (const c of palCards) {
+    c.phase = (c.phase + cadence(sel.run, ratio) * dt) % 1;
+    const z = 1.6, { ctx } = c;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, c.w, c.h);
+    ground(ctx, c.w, c.h - 12, scroll * z);
+    ctx.translate(c.w * 0.42, c.h - 12);
+    ctx.scale(z, z);
+    drawRunner(ctx, runPose(sel.run, c.phase), PALETTES[c.i]);
+  }
+  requestAnimationFrame(frame);
+}
+
+select('run', sel.run);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
